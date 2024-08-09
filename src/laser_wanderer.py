@@ -4,16 +4,29 @@ import rospy
 import numpy as np
 import math
 import sys
+from PIL import Image
 
 import utils
+from utils import get_angular_distance, get_angle_2_vectors
 
-from sensor_msgs.msg import LaserScan
+from sensor_msgs.msg import LaserScan, JointState
 from ackermann_msgs.msg import AckermannDriveStamped
-from geometry_msgs.msg import PoseStamped, PoseArray, Pose
+from geometry_msgs.msg import PoseStamped, PoseArray, Pose, Quaternion
+from nav_msgs.msg import OccupancyGrid
+from visualization_msgs.msg import Marker, MarkerArray
+from geometry_msgs.msg import Quaternion
 
-SCAN_TOPIC = '/scan' # The topic to subscribe to for laser scans
-CMD_TOPIC = '/vesc/high_level/ackermann_cmd_mux/input/nav_0' # The topic to publish controls to
-POSE_TOPIC = '/sim_car_pose/pose' # The topic to subscribe to for current pose of the car
+import tf
+import tf.transformations
+
+np.set_printoptions(threshold=sys.maxsize)
+
+SCAN_TOPIC = '/car/scan' # The topic to subscribe to for laser scans
+#CMD_TOPIC = '/vesc/high_level/ackermann_cmd_mux/input/nav_0' # The topic to publish controls to
+CMD_TOPIC = '/car/mux/ackermann_cmd_mux/input/navigation'
+#POSE_TOPIC = '/sim_car_pose/pose' # The topic to subscribe to for current pose of the car
+POSE_TOPIC = '/car/car_pose'
+#POSE_TOPIC = '/gps_new'
 VIZ_TOPIC = '/laser_wanderer/rollouts' # The topic to publish to for vizualizing
                                        # the computed rollouts. Publish a PoseArray.
 
@@ -45,12 +58,84 @@ class LaserWanderer:
     self.compute_time = compute_time
     self.laser_spread = laser_spread
     self.laser_offset = laser_offset
-    
+    self.goal_pose = np.array([10, 5, 0, 0, 0, 0, 1])
+    self.current_pose = np.array([0, 0, 0, 0, 0, 0, 1])
+    self.rssi_rollouts = np.zeros(len(deltas))
+    self.counter = 0
     self.cmd_pub = rospy.Publisher(CMD_TOPIC, AckermannDriveStamped, queue_size=1)
     self.laser_sub = rospy.Subscriber(SCAN_TOPIC, LaserScan, self.wander_cb, queue_size=2)
     self.viz_pub = rospy.Publisher(VIZ_TOPIC, PoseArray, queue_size=1)
     self.viz_sub = rospy.Subscriber(POSE_TOPIC, PoseStamped, self.viz_sub_cb, queue_size=1)
+    self.goal_pub = rospy.Publisher('/goal_PT', PoseStamped, queue_size=1)
+    self.rssi_sub = rospy.Subscriber('/occupancy_grid', OccupancyGrid, self.rssi_map_cb, queue_size=1)
+    self.viz_rssi_sub = rospy.Subscriber(POSE_TOPIC, PoseStamped, self.rssi_pose_cb, queue_size=1)
+    self.viz_rssi_pub = rospy.Publisher("/rssi_markers", MarkerArray, queue_size = 2)
+    self.cost_pub = rospy.Publisher('/mpc_cost', JointState, queue_size = 1)
 
+  def rssi_map_cb(self, msg):
+    rssi_array = np.array(msg.data).reshape((msg.info.height, msg.info.width)).astype(float)
+    #self.rssi_map = rssi_array/np.linalg.norm(rssi_array) # Normalize data
+    
+
+    if self.counter == 0:
+      array = rssi_array.astype(np.uint8)
+      image = Image.fromarray(array)
+
+      image.save('/home/robot/Downloads/output_image.png')
+      self.counter += 1
+    rssi_array = rssi_array.astype(float)
+    self.rssi_map = (rssi_array-np.min(rssi_array))/(np.max(rssi_array)-np.min(rssi_array)) 
+  '''
+  Get value of rssi at certain pose
+  '''
+  def rssi_pose_cb(self, msg):
+    ma = MarkerArray()
+    
+    trans = np.array([msg.pose.position.x, msg.pose.position.y]).reshape((2,1))
+    car_yaw = utils.quaternion_to_angle(msg.pose.orientation)
+    rot_mat = utils.rotation_matrix(car_yaw)
+    for i in xrange(self.rollouts.shape[0]):
+        robot_config = self.rollouts[i,-1,0:2].reshape(2,1)
+        map_config = rot_mat*robot_config+trans
+        map_config.flatten()
+        
+        marker = Marker()
+
+        marker.header.frame_id = "/map"
+        marker.header.stamp = rospy.Time.now()
+
+        # set shape, Arrow: 0; Cube: 1 ; Sphere: 2 ; Cylinder: 3
+        marker.type = 1
+        marker.id = i
+        
+        width = int(round(map_config[0] / 0.3)) # 0.3 is the map scale
+        if width >= 75: width = 74
+        height = int(round(map_config[1] / 0.3))
+        if height >= 112: height = 111
+        rssi_value = self.rssi_map[height, width]
+        self.rssi_rollouts[i] = rssi_value
+
+        # Set the scale of the marker
+        marker.scale.x = rssi_value
+        marker.scale.y = rssi_value
+        marker.scale.z = rssi_value
+
+        # Set the color
+        marker.color.r = rssi_value
+        marker.color.g = 0.0
+        marker.color.b = 0.0
+        marker.color.a = rssi_value
+
+        # Set the pose of the marker
+        marker.pose.position.x = map_config[0]
+        marker.pose.position.y = map_config[1]
+        marker.pose.position.z = 0
+        marker.pose.orientation.x = 0.0
+        marker.pose.orientation.y = 0.0
+        marker.pose.orientation.z = 0.0
+        marker.pose.orientation.w = 1.0
+        ma.markers.append(marker) 
+    self.viz_rssi_pub.publish(ma)
   '''
   Vizualize the rollouts. Transforms the rollouts to be in the frame of the world.
   Only display the last pose of each rollout to prevent lagginess
@@ -61,6 +146,7 @@ class LaserWanderer:
     pa.header.frame_id = '/map'
     pa.header.stamp = rospy.Time.now()
     
+    self.current_pose = np.array([msg.pose.position.x, msg.pose.position.y, msg.pose.position.z, msg.pose.orientation.x, msg.pose.orientation.y, msg.pose.orientation.z, msg.pose.orientation.w])
     trans = np.array([msg.pose.position.x, msg.pose.position.y]).reshape((2,1))
     car_yaw = utils.quaternion_to_angle(msg.pose.orientation)
     rot_mat = utils.rotation_matrix(car_yaw)
@@ -84,9 +170,9 @@ class LaserWanderer:
     rollout_pose: The pose in the trajectory 
     laser_msg: The most recent laser scan
   '''      
-  def compute_cost(self, delta, rollout_pose, laser_msg):
-    cost = np.abs(delta)
-    
+  def compute_cost(self, delta, rollout_pose, current_local_goal, rssi, laser_msg, i, car_yaw, goal_yaw):
+    #cost = np.abs(delta)
+    '''
     # Compute the angle between this rollout and robot
     raycast_angle = np.arctan2(rollout_pose[1], rollout_pose[0])
     raycast_length = np.sqrt(rollout_pose[0]**2 + rollout_pose[1]**2)
@@ -106,8 +192,40 @@ class LaserWanderer:
     
     if (not math.isnan(laser_msg.ranges[scan_idx])) and (raycast_length > laser_msg.ranges[scan_idx] - np.abs(self.laser_offset)):
         cost += MAX_PENALTY
-        
+    '''
+    # Steering cost
+    delta = 0.05 * np.abs(delta)
+    # Distance cost
+    dist = np.linalg.norm(rollout_pose[:2] - current_local_goal[:2])
+    #print dist
+    #import pdb; pdb.set_trace()
+    # Angle deviation cost
+    angle = 0
+    #angle = get_angle_2_vectors(current_local_goal[:2], rollout_pose[:2])
+    trans = rollout_pose[:2] - current_local_goal
+    rot_mat = utils.rotation_matrix(rollout_pose[2]).T
+    #current_local_goal = np.array(np.dot(rot_mat, current_local_goal[:2])).squeeze()
+    if True:
+      trans = self.current_pose[:2].reshape((2,1))
+      car_yaw = car_yaw
+      rot_mat = utils.rotation_matrix(car_yaw)
+      robot_config = rollout_pose[:2].reshape(2,1)
+      map_config = rot_mat*robot_config+trans
+      map_config.flatten()
+      map_config = np.array(map_config).squeeze()
+      direction_vector = np.array([self.goal_pose[0] - map_config[0], self.goal_pose[1] - map_config[1]])
+      theta_direction = np.arctan2(direction_vector[1], direction_vector[0])
+      diff = (rollout_pose[2] + car_yaw - theta_direction + np.pi) % (2 * np.pi) - np.pi
+      angle = np.abs(diff)
+ 
+    # Communication cost
+    rssi = 1/np.square(rssi)
+
+    # Total cost
+    cost = angle #+ rssi
+
     return cost    
+  
 
   '''
   Controls the steering angle in response to the received laser scan. Uses approximately
@@ -117,6 +235,14 @@ class LaserWanderer:
   def wander_cb(self, msg):
     start = rospy.Time.now().to_sec()
     
+    current_local_goal = self.goal_pose[:2] - self.current_pose[:2]
+    car_yaw = utils.quaternion_to_angle(Quaternion(self.current_pose[3], self.current_pose[4], self.current_pose[5], self.current_pose[6]))
+    goal_yaw = get_angle_2_vectors(np.array([1,0]), current_local_goal)
+    goal_yaw = utils.quaternion_to_angle(Quaternion(self.goal_pose[3], self.goal_pose[4], self.goal_pose[5], self.goal_pose[6])) + np.pi*4
+    rot_mat = utils.rotation_matrix(car_yaw)
+    # Apply the inverse rotation
+    current_local_goal = np.array(np.dot(rot_mat, current_local_goal[:2])).squeeze() 
+
     delta_costs = np.zeros(self.deltas.shape[0], dtype=np.float)
     traj_depth = 0
     while (rospy.Time.now().to_sec() - start < self.compute_time and 
@@ -124,11 +250,18 @@ class LaserWanderer:
         for i in xrange(self.deltas.shape[0]):
             delta_costs[i] += self.compute_cost(self.deltas[i],
                                                 self.rollouts[i,traj_depth,:],
-                                                msg)
+                                                current_local_goal,
+                                                self.rssi_rollouts[i],
+                                                msg, traj_depth, car_yaw, goal_yaw)
         traj_depth += 1
 
     delta_idx = np.argmin(delta_costs)
-    #print np.array(delta_costs, dtype=np.int)
+    print delta_costs.astype(int), delta_idx
+    #print np.array(delta_costs).astype(int)
+    costs = JointState()
+    costs.header.stamp = rospy.Time.now()
+    costs.position = delta_costs
+    self.cost_pub.publish(costs)
     #print str(self.deltas[delta_idx]) + ' ' + str(traj_depth) + ' ' + str(delta_costs[delta_idx])
     
     ads = AckermannDriveStamped()
@@ -136,7 +269,18 @@ class LaserWanderer:
     ads.header.stamp = rospy.Time.now()
     ads.drive.steering_angle = self.deltas[delta_idx]
     ads.drive.speed = self.speed
-    
+
+    pose = PoseStamped()
+    pose.header.frame_id = '/map'
+    pose.pose.position.x = self.goal_pose[0]
+    pose.pose.position.y = self.goal_pose[1]
+    pose.pose.position.z = 0.0
+    self.goal_pub.publish(pose)
+    #print np.linalg.norm(self.current_pose[:2] - self.goal_pose[:2]), current_local_quaternion_goal, 1/np.square(self.rssi_rollouts)
+    #print current_local_goal
+    if np.linalg.norm(self.current_pose[:2] - self.goal_pose[:2]) < 0.5:
+    	ads.drive.speed = 0
+    #ads.drive.speed = 0
     self.cmd_pub.publish(ads)
 
     

@@ -10,7 +10,25 @@ import tf.transformations
 import tf
 import matplotlib.pyplot as plt
 
+'''
+Get angle between two vectors
+'''
+def get_angle_2_vectors(v1, v2):
+    v1_norm = v1 / np.linalg.norm(v1)
+    v2_norm = v2 / np.linalg.norm(v2)
+    return np.arccos(np.dot(v1_norm,v2_norm))
+
 ''' 
+Get angle between quaternions
+In: 
+    Quaternion 1 and quaternion 2 (x, y, z, w)
+Out:
+    Angle in radians
+''' 
+def get_angular_distance(q1, q2):
+    q = q1 * q2
+    return 2 * np.arccos(np.abs(q[3]))
+'''
 Convert an angle in radians into a quaternion message.
 In:
     angle: The yaw angle in radians
@@ -119,7 +137,3 @@ def map_to_world(pose,map_info):
 
     # translate
     config[0] += map_info.origin.position.x
-    config[1] += map_info.origin.position.y
-    config[2] += angle
-
-    return config
